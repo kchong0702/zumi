@@ -10,12 +10,13 @@ dependencies = []
 package = false
 
 [tool.uv.workspace]
-members = []
+members = ["apps/harness"]
 
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
 typeCheckingMode = "off"
+executionEnvironments = [{ root = "apps/harness" }]
 
 [dependency-groups]
 dev = ["ruff>=0.16.10"]

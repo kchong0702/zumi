@@ -1,0 +1,44 @@
+reasoning_effort = "low"
+recursion_limit = 100
+
+[app]
+name = "harness"
+env = "dev"
+version = "0.1.0"
+
+host = "127.0.0.1"
+port = 8300
+workers = 1
+log_level = "info"
+access_log = true
+
+[observability]
+service_name = "harness"
+log_level = "INFO"
+log_format = "console"
+
+tracing_enabled = false
+metrics_enabled = false
+instrumentations = ["langchain"]
+
+[observability.trace_redaction]
+hide_inputs = false
+hide_outputs = false
+
+[database]
+url = "postgresql+psycopg://zumi:zumi@localhost:5433/zumi"
+schema_name = "harness"
+pool_size = 5
+
+[auth]
+issuer = "http://localhost:8180/realms/zumi"
+jwks_url = "http://localhost:8180/realms/zumi/protocol/openid-connect/certs"
+audience = "zumi-harness"
+leeway_s = 30
+algorithms = ["RS256"]
+
+[models]
+glm = ["glm-5.3"]
+claude = ["claude-opus-5-5", "claude-sonnet-5-5"]
+openai = ["gpt-6-luna"]
+

@@ -1,5 +1,8 @@
 name: zumi
 
+include:
+  - apps/harness/docker-compose.yaml
+
 x-base: &base
   env_file:
     - .env

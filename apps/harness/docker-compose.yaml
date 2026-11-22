@@ -1,0 +1,23 @@
+services:
+  harness:
+    image: harness:${TAG:-dev}
+    profiles: ["apps"]
+    build:
+      context: ../..
+      dockerfile: apps/harness/Dockerfile
+      target: harness
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ZUMI_HARNESS_DATABASE__URL: postgresql+psycopg://${POSTGRES_USER:-zumi}:${POSTGRES_PASSWORD:-zumi}@postgres:5432/${POSTGRES_DB:-zumi}
+      ZUMI_HARNESS_AUTH__JWKS_URL: http://keycloak:8080/realms/zumi/protocol/openid-connect/certs
+      ZUMI_HARNESS_OBSERVABILITY__OTLP_ENDPOINT: http://otel-collector:4318
+    ports:
+      - "127.0.0.1:${HARNESS_HOST_PORT:-8300}:8000"

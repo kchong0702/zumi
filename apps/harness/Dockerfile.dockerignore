@@ -1,0 +1,10 @@
+*
+!pyproject.toml
+!uv.lock
+!apps/harness
+apps/harness/.env
+apps/harness/tests
+apps/harness/docs
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
