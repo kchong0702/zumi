@@ -1,0 +1,38 @@
+{
+  "name": "@zumi/source",
+  "version": "0.0.0",
+  "license": "MIT",
+  "private": true,
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "preinstall": "npx only-allow pnpm",
+    "prepare": "husky",
+    "bootstrap:uv": "node scripts/bootstrap-python.mjs && uv sync --all-packages",
+    "bootstrap:env": "node -e \"const fs=require('fs'); if (!fs.existsSync('.env')) fs.copyFileSync('.env.example','.env')\"",
+    "bootstrap": "pnpm run bootstrap:env && pnpm run bootstrap:uv && nx run-many -t bootstrap",
+    "infra:up": "pnpm run bootstrap:env && docker compose up -d",
+    "infra:down": "docker compose --profile '*' down",
+    "infra:logs": "docker compose logs -f",
+    "dev": "nx run-many -t dev",
+    "migrate": "nx run-many -t migrate",
+    "build": "nx run-many -t build",
+    "start": "pnpm run bootstrap:env && docker compose --profile apps up -d --no-build",
+    "lint": "nx run-many -t lint",
+    "test": "nx run-many -t test",
+    "format": "prettier --write . && nx run-many -t format",
+    "format:check": "prettier --check . && nx run-many -t format:check"
+  },
+  "lint-staged": {
+    "*": "prettier --write --ignore-unknown",
+    "*.py": [
+      "uv run ruff check --fix",
+      "uv run ruff format"
+    ]
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
+    "nx": "23.0.1",
+    "prettier": "^3.9.6"
+  }
+}
