@@ -4,8 +4,8 @@ The harness needs Postgres for its threads, runs, events, transcript, usage and 
 
 ## Locally
 
-1. From the repository root, run `pnpm run bootstrap` once. It syncs the uv workspace, which holds the harness, and copies `apps/harness/.env.example` to `apps/harness/.env`. Fill in the model keys you have.
-2. Run `pnpm run infra:up`. It starts the collector, Postgres on `127.0.0.1:5433` (`POSTGRES_HOST_PORT`) and Keycloak on `http://localhost:8180`. Postgres creates the `harness` schema the first time its volume is made, and `[database] url` in `config.toml` points at it.
+1. From the repository root, run `pnpm run bootstrap` once. It syncs the uv workspace, which holds the harness, and copies `apps/harness/.env.example` to `apps/harness/.env`. Fill in the model and search keys you have.
+2. Run `pnpm run infra:up`. It starts the collector, Postgres on `127.0.0.1:5433` (`POSTGRES_HOST_PORT`), Keycloak on `http://localhost:8180` and SearXNG on `127.0.0.1:8310`. Postgres creates the `harness` schema the first time its volume is made, and `[database] url` in `config.toml` points at it.
 3. Run `pnpm exec nx run harness:migrate`. It runs the harness's Alembic migrations (`uv run alembic upgrade head`), which create the `harness` schema when missing and the harness's tables, and keep their version in `harness.alembic_version`. Run it again after you pull a new migration.
 4. Run `pnpm exec nx run harness:dev`. The server listens on `127.0.0.1:8300` and creates LangGraph's tables when it starts. `GET /health` reports that it is up.
 
@@ -24,7 +24,7 @@ The harness runs only the last user message in `messages`. A body without one ge
 
 ## In Docker Compose
 
-`docker-compose.yaml` runs the harness under the `apps` profile, and the root `docker-compose.yaml` includes it. It waits for Postgres and Keycloak, points `ZUMI_HARNESS_DATABASE__URL` at `postgres:5432` with the root `POSTGRES_*` variables, fetches the realm's keys from `keycloak:8080` and sends traces to `otel-collector:4318` when tracing is on. Build the image with `pnpm exec nx run harness:build`, then apply its migrations with:
+`docker-compose.yaml` runs the harness under the `apps` profile, and the root `docker-compose.yaml` includes it. It waits for Postgres and Keycloak, points `ZUMI_HARNESS_DATABASE__URL` at `postgres:5432` with the root `POSTGRES_*` variables, fetches the realm's keys from `keycloak:8080`, asks SearXNG at `searxng:8080` and sends traces to `otel-collector:4318` when tracing is on. Build the image with `pnpm exec nx run harness:build`, then apply its migrations with:
 
 ```bash
 docker compose run --rm --no-deps harness alembic upgrade head

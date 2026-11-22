@@ -1,14 +1,15 @@
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from functools import partial
 
 from dependency_injector import containers, providers
 from langchain_core.language_models import BaseChatModel
+from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 
 from src.agents import Agent, build_agent
-from src.agents.sothoth.tools import open_browser
+from src.agents.sothoth.tools import exa_search_tool, open_browser, web_search_tool
 from src.app.agui import ServedAgent
 from src.clients.llm_providers import llm_provider
 from src.core.config import BrowserCommand, BrowserServer, Settings
@@ -21,6 +22,7 @@ async def open_sothoth(
     recursion_limit: int,
     checkpointer: Callable[[], BaseCheckpointSaver],
     browser: BrowserCommand | BrowserServer,
+    skill_tools: Sequence[BaseTool],
 ) -> AsyncIterator[CompiledStateGraph]:
     """Builds sothoth for one run on a new chat model with checkpointer's current
     saver, and a browser that closes when the run ends"""
@@ -30,6 +32,7 @@ async def open_sothoth(
             model=model(),
             recursion_limit=recursion_limit,
             tools=browser_tools,
+            skill_tools=skill_tools,
             checkpointer=checkpointer(),
         )
 
@@ -66,6 +69,18 @@ class SothothContainer(containers.DeclarativeContainer):
             recursion_limit=settings.provided.recursion_limit,
             checkpointer=checkpointer.provider,
             browser=settings.provided.browser,
+            skill_tools=providers.List(
+                providers.Callable(
+                    web_search_tool,
+                    settings.provided.search,
+                    settings.provided.tavily_api_key,
+                ),
+                providers.Callable(
+                    exa_search_tool,
+                    settings.provided.search,
+                    settings.provided.exa_api_key,
+                ),
+            ),
         ),
     )
     """sothoth served over AG-UI, built for each run"""

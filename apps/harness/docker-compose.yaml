@@ -12,12 +12,25 @@ services:
         condition: service_healthy
       keycloak:
         condition: service_healthy
+      searxng:
+        condition: service_started
     env_file:
       - path: .env
         required: false
     environment:
       ZUMI_HARNESS_DATABASE__URL: postgresql+psycopg://${POSTGRES_USER:-zumi}:${POSTGRES_PASSWORD:-zumi}@postgres:5432/${POSTGRES_DB:-zumi}
       ZUMI_HARNESS_AUTH__JWKS_URL: http://keycloak:8080/realms/zumi/protocol/openid-connect/certs
+      ZUMI_HARNESS_SEARCH__SEARXNG_URL: http://searxng:8080
       ZUMI_HARNESS_OBSERVABILITY__OTLP_ENDPOINT: http://otel-collector:4318
     ports:
       - "127.0.0.1:${HARNESS_HOST_PORT:-8300}:8000"
+
+  searxng:
+    image: docker.io/searxng/searxng:2026.11.14-a7128d5d1
+    restart: always
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-dev-searxng-secret}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    ports:
+      - "127.0.0.1:${SEARXNG_HOST_PORT:-8310}:8080"
