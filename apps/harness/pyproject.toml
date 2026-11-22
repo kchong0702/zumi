@@ -1,0 +1,66 @@
+[project]
+name = "harness"
+version = "0.1.0"
+description = "Agent harness for Zumi and its specialist agents"
+requires-python = ">=3.13"
+dependencies = [
+    "ag-ui-langgraph>=0.0.48",
+    "ag-ui-protocol>=1.0.0",
+    "alembic>=1.20.1",
+    "deepagents>=0.7.38",
+    "dependency-injector>=4.49.1",
+    "fastapi>=0.142.2",
+    "httpx>=0.28.1",
+    "langchain>=1.5.0",
+    "anthropic>=2.12.0",
+    "langchain-anthropic>=1.7.10",
+    "langchain-core>=1.8.0",
+    "langchain-mcp-adapters>=0.3.2",
+    "langchain-openai>=1.8.0",
+    "openai>=3.57.0",
+    "langgraph>=1.2.22",
+    "langgraph-checkpoint-postgres>=3.2.1",
+    "mcp>=1.30.0",
+    "openinference-instrumentation-langchain>=0.1.90",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.2",
+    "opentelemetry-sdk>=1.45.2",
+    "psycopg[binary,pool]>=3.3.9",
+    "pydantic-settings>=2.15.0",
+    "pyjwt[crypto]>=2.15.1",
+    "python-dotenv>=1.2.4",
+    "pyyaml>=6.0.3",
+    "sqlalchemy[asyncio]>=2.1.9",
+    "structlog>=26.1.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.10",
+    "types-pyyaml>=6.0.12.20261113",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "postgres: needs a Postgres database (ZUMI_HARNESS_TEST_DATABASE_URL)",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/app/agui/events.py" = ["BLE001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.pyright]
+venvPath = "../.."
+venv = ".venv"
+typeCheckingMode = "off"
+reportImplicitOverride = "error"

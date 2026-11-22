@@ -1,0 +1,57 @@
+name: Migrations
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: zumi
+          POSTGRES_PASSWORD: zumi
+          POSTGRES_DB: zumi
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zumi -d zumi"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+
+    env:
+      ZUMI_HARNESS_DATABASE__URL: postgresql+psycopg://zumi:zumi@localhost:5432/zumi
+      ZUMI_HARNESS_TEST_DATABASE_URL: postgresql+psycopg://zumi:zumi@localhost:5432/zumi
+
+    defaults:
+      run:
+        working-directory: apps/harness
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v10.3.2
+
+      - name: Install dependencies
+        run: uv sync --package harness --locked
+
+      - name: Apply migrations
+        run: uv run alembic upgrade head
+
+      - name: Check no migration is missing (alembic check)
+        run: uv run alembic check
+
+      - name: Roll back and apply again
+        run: |
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+
+      - name: Test runs, events and usage against Postgres
+        run: uv run pytest -m postgres
