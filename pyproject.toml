@@ -16,3 +16,6 @@ members = []
 venvPath = "."
 venv = ".venv"
 typeCheckingMode = "off"
+
+[dependency-groups]
+dev = ["ruff>=0.16.10"]
