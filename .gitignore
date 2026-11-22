@@ -38,6 +38,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Playwright MCP console logs
+.playwright-mcp/
+
 # Claude Code
 .claude/worktrees
 .claude/settings.local.json

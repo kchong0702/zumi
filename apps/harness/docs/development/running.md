@@ -9,10 +9,12 @@ The harness needs Postgres for its threads, runs, events, transcript, usage and 
 3. Run `pnpm exec nx run harness:migrate`. It runs the harness's Alembic migrations (`uv run alembic upgrade head`), which create the `harness` schema when missing and the harness's tables, and keep their version in `harness.alembic_version`. Run it again after you pull a new migration.
 4. Run `pnpm exec nx run harness:dev`. The server listens on `127.0.0.1:8300` and creates LangGraph's tables when it starts. `GET /health` reports that it is up.
 
-To call an agent served at `/<name>`, get a token for `zumi-harness` from the realm, the way the channel service will: sign in as `zumi-app` and exchange the token as `zumi-channel` for the `zumi-harness` audience, as `infra/keycloak/verify.py` does. Then:
+Sothoth's browser needs Node 22 or newer for `npx`.
+
+To call an agent, get a token for `zumi-harness` from the realm, the way the channel service will: sign in as `zumi-app` and exchange the token as `zumi-channel` for the `zumi-harness` audience, as `infra/keycloak/verify.py` does. Then:
 
 ```bash
-curl -N http://127.0.0.1:8300/<name> \
+curl -N http://127.0.0.1:8300/sothoth \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"threadId": "ignored", "runId": "'"$(uuidgen)"'", "messages": [{"id": "1", "role": "user", "content": "Hi"}]}'
@@ -27,6 +29,8 @@ The harness runs only the last user message in `messages`. A body without one ge
 ```bash
 docker compose run --rm --no-deps harness alembic upgrade head
 ```
+
+The image has no Node, so Sothoth can't start Playwright MCP inside it, and `[browser]` can't be switched to a running Playwright MCP server from the environment yet. Run the harness locally to use the browser.
 
 ## Migrations
 

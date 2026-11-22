@@ -195,6 +195,42 @@ class AuthSettings(BaseModel):
     """The signing algorithms a token may use"""
 
 
+class BrowserCommand(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, use_attribute_docstrings=True
+    )
+
+    transport: Literal["stdio"] = "stdio"
+    """Start Playwright MCP for each run and talk to it over stdin and stdout"""
+
+    command: str = "npx"
+    """The program that starts Playwright MCP"""
+
+    args: tuple[str, ...] = (
+        "-y",
+        "@playwright/mcp@0.0.85",
+        "--headless",
+        "--isolated",
+        "--snapshot-mode",
+        "none",
+    )
+    """Playwright MCP's arguments, which pick the browser it drives, such as
+    --cdp-endpoint for a Chrome that is already running"""
+
+
+class BrowserServer(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, use_attribute_docstrings=True
+    )
+
+    transport: Literal["streamable_http"]
+    """Connect to a Playwright MCP server that is already running, such as one on the
+    machine whose browser it drives"""
+
+    url: str
+    """The server's MCP endpoint, such as http://browser-host:8931/mcp"""
+
+
 class AgentSettings(BaseModel):
     model_config = ConfigDict(
         extra="forbid", frozen=True, use_attribute_docstrings=True
@@ -244,6 +280,11 @@ class Settings(BaseSettings):
 
     auth: AuthSettings = Field(default_factory=AuthSettings)
     """How callers' Keycloak tokens are checked"""
+
+    browser: BrowserCommand | BrowserServer = Field(
+        default_factory=BrowserCommand, discriminator="transport"
+    )
+    """How the agents reach Playwright MCP, which drives their browser"""
 
     models: dict[Family, tuple[str, ...]] = {}
     """The models agents can run on, by family, read from config.toml's [models]"""

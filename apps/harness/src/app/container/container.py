@@ -3,6 +3,7 @@ from jwt import PyJWKClient
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from src.agents import load_agents
+from src.app.container.sothoth import SothothContainer
 from src.core.config import get_settings
 from src.infrastructure.persistence import create_engine, create_pool
 
@@ -28,5 +29,13 @@ class Container(containers.DeclarativeContainer):
     """The realm's signing keys, fetched once and again only for an unknown key or
     every five minutes"""
 
-    agents = providers.List()
+    sothoth = providers.Container(
+        SothothContainer,
+        settings=settings,
+        registry=registry,
+        checkpointer=checkpointer,
+    )
+    """sothoth, the research agent"""
+
+    agents = providers.List(sothoth.served)
     """Agents served over AG-UI"""
