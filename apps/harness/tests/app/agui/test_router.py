@@ -3,9 +3,14 @@ import json
 import os
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import (
+    AbstractAsyncContextManager,
+    asynccontextmanager,
+    contextmanager,
+    nullcontext,
+)
 from pathlib import Path
 from typing import override
 from uuid import uuid4
@@ -58,6 +63,10 @@ Event = dict[str, object]
 OpenGraph = Callable[
     [CompiledStateGraph], AbstractAsyncContextManager[CompiledStateGraph]
 ]
+REGISTRY_CALLED = threading.Event()
+"""Set once wait_for_registry starts waiting"""
+REGISTRY_ANSWERS = threading.Event()
+"""Lets wait_for_registry answer"""
 
 
 @tool(response_format="content_and_artifact")
@@ -70,6 +79,15 @@ def look_up_name(person: str) -> tuple[str, str]:
 async def look_up_slowly(person: str) -> str:
     """Looks up a person's name slowly"""
     await asyncio.sleep(0.5)
+    return "Ada"
+
+
+@tool
+async def wait_for_registry(person: str) -> str:
+    """Looks up a person's name once the registry answers"""
+    REGISTRY_CALLED.set()
+    while not REGISTRY_ANSWERS.is_set():
+        await asyncio.sleep(0.01)
     return "Ada"
 
 
@@ -149,9 +167,19 @@ async def _crashing(graph: CompiledStateGraph) -> AsyncIterator[CompiledStateGra
         yield graph
 
 
+@pytest.fixture(autouse=True)
+def registry() -> Iterator[None]:
+    """A registry that answers only once a test lets it, and at the test's end"""
+    REGISTRY_CALLED.clear()
+    REGISTRY_ANSWERS.clear()
+    yield
+    REGISTRY_ANSWERS.set()
+
+
 @pytest.fixture
 def database(realm: Realm, monkeypatch: pytest.MonkeyPatch) -> Iterator[Engine]:
-    """A schema of its own holding the harness's tables, which the app uses"""
+    """A schema of its own holding the harness's tables, which the app uses; readers
+    look again only after 30 s, so a test that follows a run needs NOTIFY to work"""
     schema = f"harness_test_{uuid4().hex[:8]}"
     engine = create_engine(
         DATABASE_URL, connect_args={"options": f"-c search_path={schema}"}
@@ -161,6 +189,7 @@ def database(realm: Realm, monkeypatch: pytest.MonkeyPatch) -> Iterator[Engine]:
         metadata.create_all(connection)
     monkeypatch.setenv("ZUMI_HARNESS_DATABASE__URL", DATABASE_URL)
     monkeypatch.setenv("ZUMI_HARNESS_DATABASE__SCHEMA_NAME", schema)
+    monkeypatch.setenv("ZUMI_HARNESS_RUNS__POLL_S", "30")
     get_settings.cache_clear()
     yield engine
     with engine.begin() as connection:
@@ -185,6 +214,7 @@ def _served(
                     look_up_age,
                     look_up_address,
                     look_up_slowly,
+                    wait_for_registry,
                 ),
                 checkpointer=container.checkpointer(),
             )
@@ -202,20 +232,32 @@ def _app(model: ScriptedChatModel, open_graph: OpenGraph = nullcontext) -> FastA
     return create_app(container)
 
 
+def _sse(lines: Iterable[str]) -> Iterator[tuple[int, Event]]:
+    """The id and AG-UI event of each SSE event in lines, as its lines arrive"""
+    fields: dict[str, str] = {}
+    for line in lines:
+        if line and not line.startswith(":"):
+            key, value = line.split(": ", 1)
+            fields[key] = value
+        elif not line and fields:
+            yield int(fields["id"]), json.loads(fields["data"])
+            fields = {}
+
+
 def _events(response: httpx.Response) -> list[tuple[int, Event]]:
     """The id and AG-UI event of each SSE event in the response"""
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    events = []
-    for block in response.text.split("\n\n"):
-        fields = dict(
-            line.split(": ", 1)
-            for line in block.splitlines()
-            if not line.startswith(":")
-        )
-        if fields:
-            events.append((int(fields["id"]), json.loads(fields["data"])))
-    return events
+    return list(_sse(response.text.splitlines()))
+
+
+def _body(run_id: str, text: str = "Greet Lovelace") -> dict[str, object]:
+    """A RunAgentInput body asking for the run with the user's text"""
+    return {
+        "threadId": "t",
+        "runId": run_id,
+        "messages": [{"id": "m", "role": "user", "content": text}],
+    }
 
 
 def _run(
@@ -723,26 +765,90 @@ def test_a_failure_recording_an_event_ends_the_run_as_an_error_with_its_end_reco
     assert _rows(database, "SELECT role FROM messages") == [{"role": "user"}]
 
 
-def test_a_run_id_that_exists_is_refused(database: Engine, realm: Realm):
+def test_posting_a_run_again_streams_that_run_from_the_start_or_the_last_event(
+    database: Engine, realm: Realm
+):
+    model = ScriptedChatModel(replies=[_call("look_up_name"), AIMessage("Hello, Ada!")])
+
+    with TestClient(_app(model)) as client:
+        first = _events(
+            client.post("/greeter", headers=realm.headers(), json=_body("run-1"))
+        )
+        again = _events(
+            client.post("/greeter", headers=realm.headers(), json=_body("run-1"))
+        )
+        later = _events(
+            client.post(
+                "/greeter",
+                headers={**realm.headers(), "Last-Event-ID": str(first[2][0])},
+                json=_body("run-1"),
+            )
+        )
+
+    assert again == first
+    assert later == first[3:]
+    assert len(model.requests) == 2
+    assert len(_rows(database, "SELECT id FROM runs")) == 1
+
+
+def test_a_finished_runs_events_replay_after_the_last_event_id_then_close(
+    database: Engine, realm: Realm
+):
+    model = ScriptedChatModel(replies=[_call("look_up_name"), AIMessage("Hello, Ada!")])
+
+    with TestClient(_app(model)) as client:
+        sent = _events(
+            client.post("/greeter", headers=realm.headers(), json=_body("run-1"))
+        )
+        replayed = _events(
+            client.get("/greeter/runs/run-1/events", headers=realm.headers())
+        )
+        later = _events(
+            client.get(
+                "/greeter/runs/run-1/events",
+                headers={**realm.headers(), "Last-Event-ID": str(sent[2][0])},
+            )
+        )
+        stranger = client.get(
+            "/greeter/runs/run-1/events", headers=realm.headers(sub=str(uuid4()))
+        )
+
+    assert replayed == sent
+    assert later == sent[3:]
+    assert later[-1][1]["type"] == "RUN_FINISHED"
+    assert stranger.status_code == 404
+
+
+def test_a_run_id_on_another_thread_is_refused_without_naming_its_run(
+    database: Engine, realm: Realm
+):
     model = ScriptedChatModel(replies=[AIMessage("Hello!")])
 
     with TestClient(_app(model)) as client:
         _run(client, realm, "Hi", run_id="run-1")
-        again = client.post(
-            "/greeter",
-            headers=realm.headers(),
-            json={
-                "threadId": "t",
-                "runId": "run-1",
-                "messages": [{"id": "m", "role": "user", "content": "Hi"}],
-            },
+        taken = client.post(
+            "/greeter", headers=realm.headers(sub=str(uuid4())), json=_body("run-1")
         )
 
-    assert again.status_code == 409
-    assert again.json()["detail"] == {
-        "message": "The run already exists",
-        "runId": "run-1",
-    }
+    assert taken.status_code == 409
+    assert taken.json()["detail"] == {"message": "The run id is taken", "runId": None}
+    assert len(model.requests) == 1
+
+
+@contextmanager
+def _served_over_http(app: FastAPI) -> Iterator[str]:
+    """Serves app with uvicorn on a free port, and stops it before the test's schema is
+    dropped"""
+    served = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
+    )
+    thread = threading.Thread(target=served.run, daemon=True)
+    thread.start()
+    while not served.started:
+        time.sleep(0.01)
+    yield f"http://127.0.0.1:{served.servers[0].sockets[0].getsockname()[1]}"
+    served.should_exit = True
+    thread.join(10)
 
 
 @pytest.fixture
@@ -761,20 +867,11 @@ def server(
         finally:
             closed.append("closed")
 
-    served = uvicorn.Server(
-        uvicorn.Config(
-            _app(model, recording), host="127.0.0.1", port=0, log_level="error"
-        )
-    )
-    threading.Thread(target=served.run, daemon=True).start()
-    while not served.started:
-        time.sleep(0.01)
-    port = served.servers[0].sockets[0].getsockname()[1]
-    yield f"http://127.0.0.1:{port}", model, closed
-    served.should_exit = True
+    with _served_over_http(_app(model, recording)) as url:
+        yield url, model, closed
 
 
-def test_a_client_that_leaves_mid_run_cancels_it_and_frees_what_it_held_open(
+def test_a_client_that_leaves_mid_run_leaves_it_running_and_can_replay_it(
     server: tuple[str, ScriptedChatModel, list[str]],
     database: Engine,
     realm: Realm,
@@ -782,25 +879,27 @@ def test_a_client_that_leaves_mid_run_cancels_it_and_frees_what_it_held_open(
     url, model, closed = server
 
     with httpx.stream(
-        "POST",
-        f"{url}/greeter",
-        headers=realm.headers(),
-        json={
-            "threadId": "t",
-            "runId": "run-1",
-            "messages": [{"id": "m", "role": "user", "content": "Greet Lovelace"}],
-        },
+        "POST", f"{url}/greeter", headers=realm.headers(), json=_body("run-1")
     ) as response:
-        for line in response.iter_lines():
-            if '"TOOL_CALL_START"' in line:
+        for _, event in _sse(response.iter_lines()):
+            if event["type"] == "TOOL_CALL_START":
                 break
-    time.sleep(1.5)
+    replayed = _events(
+        httpx.get(
+            f"{url}/greeter/runs/run-1/events", headers=realm.headers(), timeout=10
+        )
+    )
 
+    events = [event for _, event in replayed]
+    assert [e["type"] for e in events].count("RUN_STARTED") == 1
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert _text(events) == "Hello, Ada!"
+    assert [
+        row["id"] for row in _rows(database, "SELECT id FROM run_events ORDER BY id")
+    ] == [event_id for event_id, _ in replayed]
+    assert len(model.requests) == 2
     assert closed == ["closed"]
-    assert len(model.requests) == 1
-    [run] = _rows(database, "SELECT status, finished_at FROM runs")
-    assert run["status"] == "cancelled"
-    assert run["finished_at"] is not None
+    assert _rows(database, "SELECT status FROM runs") == [{"status": "finished"}]
 
 
 def test_of_two_runs_started_at_once_on_a_thread_one_streams_and_one_is_refused(
@@ -835,3 +934,371 @@ def test_of_two_runs_started_at_once_on_a_thread_one_streams_and_one_is_refused(
     assert _rows(database, "SELECT id, status FROM runs") == [
         {"id": events[0]["runId"], "status": "finished"}
     ]
+
+
+def test_a_run_cancelled_through_another_replica_ends_with_a_cancelled_outcome(
+    database: Engine, realm: Realm
+):
+    model = ScriptedChatModel(replies=[_call("wait_for_registry"), AIMessage("Hi!")])
+    events: list[Event] = []
+
+    with (
+        _served_over_http(_app(model)) as url,
+        TestClient(_app(ScriptedChatModel(replies=[]))) as other,
+        httpx.stream(
+            "POST",
+            f"{url}/greeter",
+            headers=realm.headers(),
+            json=_body("run-1"),
+            timeout=5,
+        ) as response,
+    ):
+        for _, event in _sse(response.iter_lines()):
+            events.append(event)
+            if event["type"] == "TOOL_CALL_START":
+                cancelled = other.post(
+                    "/greeter/runs/run-1/cancel", headers=realm.headers()
+                )
+        again = other.post("/greeter/runs/run-1/cancel", headers=realm.headers())
+        run = other.get("/greeter/runs/run-1", headers=realm.headers()).json()
+
+    assert cancelled.status_code == 202
+    assert [e["type"] for e in events].count("RUN_FINISHED") == 1
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert events[-1]["outcome"] == {"type": "cancelled"}
+    assert run["status"] == "cancelled"
+    assert again.status_code == 409
+    assert len(model.requests) == 1
+
+
+def _start_in_background(
+    client: TestClient, realm: Realm, pool: ThreadPoolExecutor
+) -> Future[httpx.Response]:
+    """Posts run-1 from another thread, returning once its tool is waiting on the
+    registry"""
+    streamed = pool.submit(
+        client.post, "/greeter", headers=realm.headers(), json=_body("run-1")
+    )
+    assert REGISTRY_CALLED.wait(5)
+    return streamed
+
+
+def test_a_run_whose_replica_died_is_resumed_from_its_checkpoint_by_another(
+    database: Engine, realm: Realm
+):
+    first = ScriptedChatModel(replies=[_call("wait_for_registry")])
+    second = ScriptedChatModel(replies=[AIMessage("Hello, Ada!")])
+    dying = _app(first)
+
+    with TestClient(dying) as client, ThreadPoolExecutor() as pool:
+        streamed = _start_in_background(client, realm, pool)
+        client.portal.call(dying.state.runner.stop)
+        with database.begin() as connection:
+            connection.execute(
+                text("UPDATE runs SET heartbeat_at = now() - interval '1 hour'")
+            )
+        REGISTRY_ANSWERS.set()
+        taken_over_at = time.monotonic()
+        with TestClient(_app(second)) as other:
+            replayed = _events(
+                other.get("/greeter/runs/run-1/events", headers=realm.headers())
+            )
+        followed = _events(streamed.result(10))
+        elapsed_s = time.monotonic() - taken_over_at
+
+    events = [event for _, event in replayed]
+    types = [e["type"] for e in events]
+    assert types.count("RUN_STARTED") == 1
+    assert [e["name"] for e in events if e["type"] == "CUSTOM"] == ["run_resumed"]
+    assert types.count("RUN_FINISHED") + types.count("RUN_ERROR") == 1
+    assert types[-1] == "RUN_FINISHED"
+    assert _text(events) == "Hello, Ada!"
+    assert [(m.type, m.text) for m in second.requests[0] if m.type != "system"] == [
+        ("human", "Greet Lovelace"),
+        ("ai", ""),
+        ("tool", "Ada"),
+    ]
+    assert followed == replayed
+    assert elapsed_s < 10
+    assert _rows(database, "SELECT status FROM runs") == [{"status": "finished"}]
+
+
+@pytest.mark.parametrize(
+    ("stopped", "code", "message"),
+    [
+        (
+            "created_at = now() - interval '11 minutes'",
+            "timeout",
+            "The assistant stopped responding.",
+        ),
+        ("attempts = 3", "timeout", "The assistant kept stopping on this message."),
+        ("input = '{}'", "storage_error", "validation errors for StaleRun"),
+    ],
+)
+def test_a_stopped_run_that_cannot_resume_ends_at_once_with_the_reason(
+    database: Engine, realm: Realm, stopped: str, code: str, message: str
+):
+    second = ScriptedChatModel(replies=[AIMessage("Hello, Ada!")])
+    dying = _app(ScriptedChatModel(replies=[_call("wait_for_registry")]))
+
+    with TestClient(dying) as client, ThreadPoolExecutor() as pool:
+        streamed = _start_in_background(client, realm, pool)
+        client.portal.call(dying.state.runner.stop)
+        with database.begin() as connection:
+            connection.execute(text(f"UPDATE runs SET heartbeat_at = NULL, {stopped}"))
+        with TestClient(_app(second)) as other:
+            run = other.get("/greeter/runs/run-1", headers=realm.headers()).json()
+        events = [event for _, event in _events(streamed.result(10))]
+
+    types = [e["type"] for e in events]
+    assert "CUSTOM" not in types
+    assert types.count("RUN_STARTED") == 1
+    assert types.count("RUN_FINISHED") + types.count("RUN_ERROR") == 1
+    assert (events[-1]["type"], events[-1]["code"]) == ("RUN_ERROR", code)
+    assert message in events[-1]["message"]
+    assert (run["status"], run["errorCode"]) == ("error", code)
+    assert second.requests == []
+
+
+def test_a_replica_that_lost_its_run_records_nothing_more_of_it(
+    database: Engine, realm: Realm
+):
+    model = ScriptedChatModel(replies=[_call("wait_for_registry"), AIMessage("Hi!")])
+
+    with TestClient(_app(model)) as client, ThreadPoolExecutor() as pool:
+        streamed = _start_in_background(client, realm, pool)
+        with database.begin() as connection:
+            connection.execute(text("UPDATE runs SET owner = 'another-replica'"))
+        recorded = _rows(database, "SELECT id FROM run_events ORDER BY id")
+        REGISTRY_ANSWERS.set()
+        time.sleep(0.3)
+        after = _rows(database, "SELECT id FROM run_events ORDER BY id")
+        run = _rows(database, "SELECT status, owner FROM runs")
+        with database.begin() as connection:
+            connection.execute(text("UPDATE runs SET status = 'cancelled'"))
+            connection.execute(
+                text("SELECT pg_notify(current_schema() || '.run_events', 'run-1')")
+            )
+        streamed.result(10)
+
+    assert after == recorded
+    assert run == [{"status": "running", "owner": "another-replica"}]
+    assert len(model.requests) == 1
+
+
+def test_a_run_whose_checkpoint_lacks_its_message_starts_its_turn_again(
+    database: Engine, realm: Realm
+):
+    second = ScriptedChatModel(replies=[AIMessage("Hello, Ada!")])
+    dying = _app(ScriptedChatModel(replies=[_call("wait_for_registry")]))
+
+    with TestClient(dying) as client, ThreadPoolExecutor() as pool:
+        streamed = _start_in_background(client, realm, pool)
+        client.portal.call(dying.state.runner.stop)
+        with database.begin() as connection:
+            connection.execute(text("DELETE FROM checkpoint_writes"))
+            connection.execute(text("DELETE FROM checkpoint_blobs"))
+            connection.execute(text("DELETE FROM checkpoints"))
+            connection.execute(
+                text("UPDATE runs SET heartbeat_at = now() - interval '1 hour'")
+            )
+        with TestClient(_app(second)):
+            events = [event for _, event in _events(streamed.result(10))]
+
+    assert [e["name"] for e in events if e["type"] == "CUSTOM"] == ["run_resumed"]
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert _text(events) == "Hello, Ada!"
+    assert [(m.type, m.text) for m in second.requests[0] if m.type != "system"] == [
+        ("human", "Greet Lovelace")
+    ]
+
+
+def test_a_cancel_whose_notification_was_missed_is_seen_on_the_next_heartbeat(
+    database: Engine, realm: Realm, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("ZUMI_HARNESS_RUNS__HEARTBEAT_S", "0.1")
+    get_settings.cache_clear()
+    model = ScriptedChatModel(replies=[_call("wait_for_registry"), AIMessage("Hi!")])
+
+    with TestClient(_app(model)) as client, ThreadPoolExecutor() as pool:
+        streamed = _start_in_background(client, realm, pool)
+        with database.begin() as connection:
+            connection.execute(text("UPDATE runs SET cancel_requested_at = now()"))
+        events = [event for _, event in _events(streamed.result(5))]
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert events[-1]["outcome"] == {"type": "cancelled"}
+    assert _rows(database, "SELECT status FROM runs") == [{"status": "cancelled"}]
+
+
+def test_a_replica_that_shuts_down_hands_its_run_to_the_next_at_once(
+    database: Engine, realm: Realm, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("ZUMI_HARNESS_RUNS__SWEEP_S", "600")
+    monkeypatch.setenv("ZUMI_HARNESS_RUNS__DEAD_AFTER_S", "1200")
+    get_settings.cache_clear()
+    second = ScriptedChatModel(replies=[AIMessage("Hello, Ada!")])
+
+    with _served_over_http(
+        _app(ScriptedChatModel(replies=[_call("wait_for_registry")]))
+    ) as url:
+        with httpx.stream(
+            "POST", f"{url}/greeter", headers=realm.headers(), json=_body("run-1")
+        ) as response:
+            for _, event in _sse(response.iter_lines()):
+                if event["type"] == "TOOL_CALL_START":
+                    break
+        assert REGISTRY_CALLED.wait(5)
+    shut_down_at = time.monotonic()
+    REGISTRY_ANSWERS.set()
+    next_app = _app(second)
+    with TestClient(next_app) as other:
+        assert _rows(database, "SELECT owner FROM runs") == [
+            {"owner": next_app.state.runner.owner}
+        ]
+        events = [
+            event
+            for _, event in _events(
+                other.get("/greeter/runs/run-1/events", headers=realm.headers())
+            )
+        ]
+    elapsed_s = time.monotonic() - shut_down_at
+
+    assert elapsed_s < 10
+    assert [e["name"] for e in events if e["type"] == "CUSTOM"] == ["run_resumed"]
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert _text(events) == "Hello, Ada!"
+
+
+def test_a_run_whose_replica_died_after_its_last_checkpoint_ends_with_that_answer(
+    database: Engine, realm: Realm
+):
+    second = ScriptedChatModel(replies=[AIMessage("Something else.")])
+
+    with TestClient(_app(ScriptedChatModel(replies=[AIMessage("Hello, Ada!")]))) as c:
+        _run(c, realm, "Hi, I'm Ada", run_id="run-1")
+    with database.begin() as connection:
+        connection.execute(text("DELETE FROM run_events WHERE type <> 'RUN_STARTED'"))
+        connection.execute(text("DELETE FROM messages WHERE role = 'assistant'"))
+        connection.execute(
+            text(
+                "UPDATE runs SET status = 'running', finished_at = NULL,"
+                " heartbeat_at = NULL"
+            )
+        )
+    with TestClient(_app(second)) as other:
+        events = [
+            event
+            for _, event in _events(
+                other.get("/greeter/runs/run-1/events", headers=realm.headers())
+            )
+        ]
+        transcript = other.get("/greeter/threads/messages", headers=realm.headers())
+
+    assert [e["type"] for e in events] == [
+        "RUN_STARTED",
+        "CUSTOM",
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+        "RUN_FINISHED",
+    ]
+    assert _text(events) == "Hello, Ada!"
+    assert second.requests == []
+    assert [(m["role"], m["content"]) for m in transcript.json()] == [
+        ("user", "Hi, I'm Ada"),
+        ("assistant", "Hello, Ada!"),
+    ]
+    assert _rows(database, "SELECT status FROM runs") == [{"status": "finished"}]
+
+
+def test_of_two_replicas_sweeping_one_stopped_run_at_once_one_resumes_it(
+    database: Engine, realm: Realm
+):
+    models = [ScriptedChatModel(replies=[AIMessage("Hello, Ada!")]) for _ in "ab"]
+    apps = [_app(model) for model in models]
+    dying = _app(ScriptedChatModel(replies=[_call("wait_for_registry")]))
+
+    with TestClient(dying) as client, ThreadPoolExecutor() as pool:
+        streamed = _start_in_background(client, realm, pool)
+        client.portal.call(dying.state.runner.stop)
+        REGISTRY_ANSWERS.set()
+        with TestClient(apps[0]) as first, TestClient(apps[1]) as second:
+            with database.begin() as connection:
+                connection.execute(text("UPDATE runs SET heartbeat_at = NULL"))
+            sweeps = [
+                pool.submit(other.portal.call, app.state.runner.sweep)
+                for other, app in zip((first, second), apps, strict=True)
+            ]
+            for sweep in sweeps:
+                sweep.result(10)
+            events = [event for _, event in _events(streamed.result(10))]
+
+    types = [e["type"] for e in events]
+    assert [e["name"] for e in events if e["type"] == "CUSTOM"] == ["run_resumed"]
+    assert types.count("RUN_STARTED") == 1
+    assert types.count("RUN_FINISHED") + types.count("RUN_ERROR") == 1
+    assert types[-1] == "RUN_FINISHED"
+    assert _text(events) == "Hello, Ada!"
+    assert sum(len(model.requests) for model in models) == 1
+    assert _rows(database, "SELECT attempts FROM runs") == [{"attempts": 1}]
+
+
+def test_a_run_beyond_max_workers_is_refused_until_a_worker_is_free(
+    database: Engine, realm: Realm, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("ZUMI_HARNESS_RUNS__MAX_WORKERS", "1")
+    get_settings.cache_clear()
+    model = ScriptedChatModel(replies=[_call("wait_for_registry"), AIMessage("Hi!")])
+
+    with TestClient(_app(model)) as client, ThreadPoolExecutor() as pool:
+        streamed = _start_in_background(client, realm, pool)
+        refused = client.post(
+            "/greeter", headers=realm.headers(sub=str(uuid4())), json=_body("run-2")
+        )
+        attached = pool.submit(
+            client.post, "/greeter", headers=realm.headers(), json=_body("run-1")
+        )
+        REGISTRY_ANSWERS.set()
+        _events(streamed.result(10))
+        reattached = _events(attached.result(10))
+        later = _run(client, realm, "Hi", run_id="run-3", sub=str(uuid4()))
+
+    assert refused.status_code == 503
+    assert refused.headers["retry-after"] == "5"
+    assert reattached[-1][1]["type"] == "RUN_FINISHED"
+    assert later[-1]["type"] == "RUN_FINISHED"
+    assert _rows(database, "SELECT id FROM runs ORDER BY id") == [
+        {"id": "run-1"},
+        {"id": "run-3"},
+    ]
+
+
+CLOSED: list[str] = []
+"""What _slow_to_close closed"""
+
+
+@asynccontextmanager
+async def _slow_to_close(
+    graph: CompiledStateGraph,
+) -> AsyncIterator[CompiledStateGraph]:
+    """Opens graph and takes half a second to close it, as a browser does"""
+    yield graph
+    await asyncio.sleep(0.5)
+    CLOSED.append("closed")
+
+
+def test_a_heartbeat_leaves_a_finished_run_to_close_what_it_held(
+    database: Engine, realm: Realm, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("ZUMI_HARNESS_RUNS__HEARTBEAT_S", "0.05")
+    get_settings.cache_clear()
+    CLOSED.clear()
+    model = ScriptedChatModel(replies=[AIMessage("Hello!")])
+
+    with TestClient(_app(model, _slow_to_close)) as client:
+        events = _run(client, realm, "Hi")
+        time.sleep(0.7)
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert CLOSED == ["closed"]

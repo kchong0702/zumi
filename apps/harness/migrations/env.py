@@ -52,7 +52,7 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_async_migrations() -> None:
     """Runs the migrations on the harness's engine, whose search path is its schema"""
-    engine = create_engine(settings)
+    engine = create_engine(settings, settings.pool_size)
     async with engine.connect() as connection:
         await connection.run_sync(do_run_migrations)
         await connection.commit()
