@@ -1,0 +1,50 @@
+[app]
+env = "dev"
+version = "0.1.0"
+host = "127.0.0.1"
+port = 8400
+header_timeout = "10s"
+shutdown_timeout = "10s"
+
+[observability]
+service_name = "channel-service"
+log_level = "info"
+log_format = "json"
+tracing_enabled = false
+metrics_enabled = false
+metrics_export_interval = "60s"
+otlp_endpoint = "http://localhost:4318"
+
+[database]
+url = "postgresql://zumi:zumi@localhost:5433/zumi"
+schema_name = "channel"
+
+[auth]
+issuer = "http://localhost:8180/realms/zumi"
+jwks_url = "http://localhost:8180/realms/zumi/protocol/openid-connect/certs"
+token_url = "http://localhost:8180/realms/zumi/protocol/openid-connect/token"
+audience = "zumi-channel"
+client_id = "zumi-channel"
+harness_audience = "zumi-harness"
+leeway = "30s"
+
+[harness]
+url = "http://127.0.0.1:8300"
+agent = "sothoth"
+idle_timeout = "45s"
+max_event_bytes = 1048576
+cancel_timeout = "10s"
+
+[relay]
+reconnect_initial = "1s"
+reconnect_max = "30s"
+give_up_after = "10m"
+persist_interval = "1s"
+
+[websocket]
+allowed_origins = ["tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"]
+auth_timeout = "10s"
+send_buffer = 256
+write_timeout = "10s"
+ping_interval = "30s"
+max_unauthenticated = 64

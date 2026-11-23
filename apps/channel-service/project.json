@@ -1,0 +1,75 @@
+{
+  "name": "channel-service",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "projectType": "application",
+  "sourceRoot": "apps/channel-service",
+  "tags": ["type:app", "scope:backend"],
+  "targets": {
+    "bootstrap": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "node -e \"const fs=require('fs'); if (!fs.existsSync('.env')) fs.copyFileSync('.env.example','.env')\"",
+        "cwd": "apps/channel-service"
+      }
+    },
+    "dev": {
+      "executor": "nx:run-commands",
+      "continuous": true,
+      "options": {
+        "command": "go run ./cmd/channel-service",
+        "cwd": "apps/channel-service"
+      }
+    },
+    "migrate": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "go run ./cmd/channel-service migrate",
+        "cwd": "apps/channel-service"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "go vet ./...",
+          "go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run"
+        ],
+        "parallel": false,
+        "cwd": "apps/channel-service"
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "gofmt -w .",
+        "cwd": "apps/channel-service"
+      }
+    },
+    "format:check": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "test -z \"$(gofmt -l . | tee /dev/stderr)\"",
+        "cwd": "apps/channel-service"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "inputs": [
+        "default",
+        {
+          "env": "ZUMI_CHANNEL_TEST_DATABASE_URL"
+        }
+      ],
+      "options": {
+        "command": "go test -race ./...",
+        "cwd": "apps/channel-service"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "docker compose build channel-service"
+      }
+    }
+  }
+}

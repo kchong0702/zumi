@@ -1,0 +1,55 @@
+name: Migrations
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  channel-service:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: zumi
+          POSTGRES_PASSWORD: zumi
+          POSTGRES_DB: zumi
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zumi -d zumi"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+
+    env:
+      ZUMI_CHANNEL_DATABASE__URL: postgresql://zumi:zumi@localhost:5432/zumi
+      ZUMI_CHANNEL_AUTH__CLIENT_SECRET: ci-unused
+      ZUMI_CHANNEL_TEST_DATABASE_URL: postgresql://zumi:zumi@localhost:5432/zumi
+
+    defaults:
+      run:
+        working-directory: apps/channel-service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/channel-service/go.mod
+          cache-dependency-path: apps/channel-service/go.sum
+
+      - name: Apply migrations
+        run: go run ./cmd/channel-service migrate
+
+      - name: Roll back and apply again
+        run: |
+          go run ./cmd/channel-service migrate down
+          go run ./cmd/channel-service migrate
+
+      - name: Test against Postgres
+        run: go test -race ./...

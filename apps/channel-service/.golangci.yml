@@ -1,0 +1,12 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      exclude-functions:
+        - (*github.com/coder/websocket.Conn).Close
+        - (*github.com/coder/websocket.Conn).CloseNow
+        - (*github.com/jackc/pgx/v5.Conn).Close
+        - (*database/sql.DB).Close
+        - (io.Closer).Close
+        - fmt.Fprintf
