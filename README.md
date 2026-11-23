@@ -7,6 +7,7 @@ Zumi is a personal assistant that remembers you. This repository is an Nx monore
 | Path                   | Holds                                                          |
 | ---------------------- | -------------------------------------------------------------- |
 | `apps/`                | The services, one Nx project each                              |
+| `apps/channel-service` | The Go service the apps talk to over one WebSocket each        |
 | `infra/otel-collector` | The OpenTelemetry Collector config the services send traces to |
 | `scripts/`             | Bootstrap and commit-policy scripts                            |
 | `docker-compose.yaml`  | Shared infrastructure: the collector and Postgres              |
@@ -15,6 +16,7 @@ Zumi is a personal assistant that remembers you. This repository is an Nx monore
 
 - Node 24 and pnpm 11 (`corepack enable`)
 - [uv](https://docs.astral.sh/uv/) for the Python services
+- Go 1.27 for the channel service
 - Docker
 
 ## Getting started

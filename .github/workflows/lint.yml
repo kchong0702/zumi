@@ -22,6 +22,12 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/channel-service/go.mod
+          cache-dependency-path: apps/channel-service/go.sum
+
       - name: Setup uv
         uses: astral-sh/setup-uv@v10.3.2
 
@@ -30,7 +36,7 @@ jobs:
           pnpm install --frozen-lockfile
           uv sync --all-packages --locked
 
-      - name: Check formatting (Prettier + Ruff)
+      - name: Check formatting (Prettier + Ruff + gofmt)
         run: pnpm run format:check
 
   lint:
@@ -49,6 +55,12 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/channel-service/go.mod
+          cache-dependency-path: apps/channel-service/go.sum
+
       - name: Setup uv
         uses: astral-sh/setup-uv@v10.3.2
 
@@ -57,7 +69,7 @@ jobs:
           pnpm install --frozen-lockfile
           uv sync --all-packages --locked
 
-      - name: Lint (ESLint + Ruff)
+      - name: Lint (ESLint + Ruff + go vet + golangci-lint)
         run: pnpm exec nx run-many -t lint
 
       - name: Typecheck (TypeScript + Pyright)

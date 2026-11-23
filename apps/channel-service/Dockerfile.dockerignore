@@ -1,0 +1,5 @@
+*
+!apps/channel-service
+apps/channel-service/.env
+apps/channel-service/docs
+apps/channel-service/**/*_test.go

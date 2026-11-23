@@ -1,0 +1,39 @@
+x-channel-service: &channel-service
+  image: channel-service:${TAG:-dev}
+  profiles: ["apps"]
+  build:
+    context: ../..
+    dockerfile: apps/channel-service/Dockerfile
+    target: channel-service
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    ZUMI_CHANNEL_DATABASE__URL: postgresql://${POSTGRES_USER:-zumi}:${POSTGRES_PASSWORD:-zumi}@postgres:5432/${POSTGRES_DB:-zumi}
+    ZUMI_CHANNEL_AUTH__JWKS_URL: http://keycloak:8080/realms/zumi/protocol/openid-connect/certs
+    ZUMI_CHANNEL_AUTH__TOKEN_URL: http://keycloak:8080/realms/zumi/protocol/openid-connect/token
+    ZUMI_CHANNEL_AUTH__CLIENT_SECRET: ${KEYCLOAK_CHANNEL_CLIENT_SECRET:-dev-zumi-channel-secret}
+    ZUMI_CHANNEL_HARNESS__URL: ${CHANNEL_HARNESS_URL:-http://harness:8000}
+    ZUMI_CHANNEL_OBSERVABILITY__OTLP_ENDPOINT: http://otel-collector:4318
+
+services:
+  channel-service-migrate:
+    <<: *channel-service
+    command: ["migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  channel-service:
+    <<: *channel-service
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      channel-service-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${CHANNEL_SERVICE_HOST_PORT:-8400}:8000"
