@@ -29,6 +29,17 @@ hide_outputs = false
 url = "postgresql+psycopg://zumi:zumi@localhost:5433/zumi"
 schema_name = "harness"
 pool_size = 5
+upkeep_pool_size = 2
+
+[runs]
+heartbeat_s = 10
+sweep_s = 15
+dead_after_s = 30
+resume_within_s = 600
+poll_s = 5
+max_workers = 4
+max_attempts = 3
+retry_after_s = 5
 
 [auth]
 issuer = "http://localhost:8180/realms/zumi"

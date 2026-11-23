@@ -63,21 +63,26 @@ Codenames come from the architecture diagram and are for people only. A tool kee
 
 `src/app/agui/router.py` serves every `ServedAgent(name, model_provider, open_graph)` in the container's `agents` at its own root, `/<name>`:
 
-| Route                          | Does                                                                                                                                            |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /<name>`                 | Takes an AG-UI `RunAgentInput` and streams the run's AG-UI events as `text/event-stream`                                                        |
-| `GET /<name>/runs/<id>`        | The status of one of the caller's runs: `status`, `errorCode`, `error`, `createdAt`, `firstTokenAt`, `finishedAt`                               |
-| `GET /<name>/threads/messages` | The caller's transcript with the agent, oldest first: the latest `limit` messages (default 50, at most 100), written before `before` when given |
+| Route                           | Does                                                                                                                                            |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /<name>`                  | Takes an AG-UI `RunAgentInput`, starts the run, and streams its AG-UI events as `text/event-stream`, after `Last-Event-ID` when sent            |
+| `GET /<name>/runs/<id>`         | The status of one of the caller's runs: `status`, `errorCode`, `error`, `createdAt`, `firstTokenAt`, `finishedAt`                               |
+| `GET /<name>/runs/<id>/events`  | One of the caller's runs' events, after `Last-Event-ID` when sent, then new ones until the run ends                                             |
+| `POST /<name>/runs/<id>/cancel` | Asks the process working on one of the caller's runs to cancel it                                                                               |
+| `GET /<name>/threads/messages`  | The caller's transcript with the agent, oldest first: the latest `limit` messages (default 50, at most 100), written before `before` when given |
 
-`GET /health` reports that the server is up, with the app's version, and needs no token. `open_graph` is an async context manager that opens the agent's graph for one run, together with anything the run holds open, such as a browser. It closes them when the run ends, including when the run fails or the client leaves. Build the graph inside `open_graph` and ask the checkpointer's provider for the saver there, as `open_sothoth` does. The app makes the saver when it starts, inside the running event loop, as `AsyncPostgresSaver` must be.
+`GET /health` reports that the server is up, with the app's version, and needs no token. `open_graph` is an async context manager that opens the agent's graph for one run, together with anything the run holds open, such as a browser. It closes them when the run ends, including when the run fails, is cancelled or its process stops. Build the graph inside `open_graph` and ask the checkpointer's provider for the saver there, as `open_sothoth` does. The app makes the saver when it starts, inside the running event loop, as `AsyncPostgresSaver` must be.
 
 ```mermaid
 flowchart LR
   channel[channel service] -- "Bearer token, RunAgentInput" --> router["POST /sothoth"]
   router -- "JWKS, cached" --> keycloak[Keycloak realm zumi]
-  router --> agent[LangGraphAgent and the agent's graph]
+  router --> runner[Runner: workers, heartbeat, sweep]
+  runner --> agent[LangGraphAgent and the agent's graph]
   agent --> checkpointer[(harness schema: LangGraph checkpoints)]
-  router --> tables[(harness schema: threads, runs, run_events, messages, usage)]
+  runner -- "runs with RUN_STARTED, events, NOTIFY" --> tables[(harness schema: threads, runs, run_events, messages, usage)]
+  tables -- "notifications, on one LISTEN connection per process" --> runner
+  tables -- "replay and follow" --> router
   router -- "SSE, id = run_events.id" --> channel
 ```
 
@@ -91,22 +96,124 @@ PyJWT's `PyJWKClient` fetches the keys from `[auth] jwks_url`, the realm's `/pro
 
 A thread is one user's lifelong conversation with one agent through one client: a `threads` row keyed by agent, `client_id` (the token's `azp`) and `user_id` (its `sub`), made on first use. The client's `threadId` is ignored, so a client can't read or write another thread, and two agents never share one. The LangGraph `thread_id` is `threads.id`, so the checkpointer keeps the conversation under it.
 
-`POST /<name>` builds the run's turn and records the run as `running` before it streams anything, with that turn and the user's text:
+`POST /<name>` builds the run's turn and, in one transaction, records the run as `running`, owned by the process, with that turn, the user's text and the run's `RUN_STARTED` as its first event, before it starts it:
 
 - **Only the last user message.** The turn is a new `RunAgentInput` on the thread holding only the client's last user message, under the run's id. The harness stores the turn in `runs.input` and runs it, so a client can't edit, fork or add to the thread's history, and nothing else it sent is kept. A `RunAgentInput` without a user message gets 422 before anything is recorded.
 - **One run at a time per thread.** A unique index on `runs(thread_id)` where `status = 'running'` refuses a second run while one is running, across every process. The second request gets 409 with `{"message": ..., "runId": <the running run>}`.
-- **A run id is used once.** A `runId` that already exists violates `runs`' primary key and gets 409 with that `runId`. Any other integrity error is raised as it is.
+- **A run id is used once.** A `runId` the caller's thread already has is that run, and the request streams it (see [Runs and recovery](#runs-and-recovery)). One on another thread gets 409 with no `runId`. Any other integrity error is raised as it is.
+- **A process works on at most `[runs] max_workers` runs.** A `POST /<name>` that would start one more gets 503 with `Retry-After: [runs] retry_after_s` and nothing is recorded, so the client can try again, or another replica. A repeat `POST` of a run the caller already has attaches to it even then, since it starts no worker.
 
-The run is tied to its request. When the client leaves before the run's terminal event is recorded, the run stops, what it held open closes and the run is recorded as `cancelled`.
+### Runs and recovery
+
+A run doesn't belong to the request that started it. `POST /<name>` records the run and hands it to the process's `Runner` (`src/app/agui/runner.py`), which runs the graph in an asyncio task of its own, a worker, and records each event. Every response, `POST /<name>`'s own included, only reads: it replays the run's `run_events` and then follows new ones until the terminal event. A client that leaves stops reading and nothing else; the run goes on and its events stay replayable.
+
+- **Following a run.** Recording an event `NOTIFY`s `<schema>.run_events` with the run's id in the same transaction, one `NOTIFY` per event, and each process `LISTEN`s on one psycopg connection of its own. Both sides name the channel from `current_schema()` on their own connection, whose `search_path` is `[database] schema_name`, and the settings accept only a lowercase identifier there, so the names match. A notification wakes that process's readers of the run, so any replica can serve any reader. A reader that misses one looks again after `[runs] poll_s` seconds. The `LISTEN` connection sends TCP keepalives every `[runs] heartbeat_s` seconds, rounded up, and gives up after three unanswered ones; when it fails the process connects and listens again, waiting 1 second, then twice as long each time up to `poll_s`.
+- **Attaching.** A `POST /<name>` with a `runId` the caller's thread already has streams that run instead of starting another, from its start or after `Last-Event-ID`. A `runId` on another thread gets 409 with `{"message": "The run id is taken", "runId": null}`. `GET /<name>/runs/<id>/events` does the same for one of the caller's runs, and closes after the terminal event; 404 for a run that isn't the caller's.
+- **Cancelling.** `POST /<name>/runs/<id>/cancel` sets `runs.cancel_requested_at` and `NOTIFY`s `<schema>.run_cancels`. The process working on the run cancels its worker, which records `RUN_FINISHED` with AG-UI's cancelled outcome (`{"type": "cancelled"}`) and status `cancelled`. It answers 202 for a running run and 409 for one that ended.
+- **Leases.** Each process names itself `<host>:<8 hex>` when it starts, its `owner`. A run it starts or takes over has `runs.owner` set to it and `heartbeat_at` to now. Every `[runs] heartbeat_s` seconds it sets `heartbeat_at` on the running runs it has workers for. It stops a worker only when the run's `owner` is now another process, and cancels a running run with `cancel_requested_at` set, in case the notification was missed. A worker leaves the heartbeat once its run's end commits, so the heartbeat never touches a run that is closing what it held, such as Sothoth's browser.
+- **Fencing.** An event is recorded only while the run is `running` and its `owner` is the recording process, checked under a `FOR SHARE` lock on the run in the event's own transaction; otherwise the worker stops and records nothing more. The terminal event's transaction updates the run only on the same condition.
+- **Taking over.** Every process sweeps once when it starts and then every `[runs] sweep_s` seconds. One `UPDATE ... RETURNING` makes it the owner of the running runs of the agents it serves whose `heartbeat_at` is null or older than `[runs] dead_after_s` seconds, at most as many as it has free workers, and adds one to each run's `attempts`. It picks them with `FOR UPDATE SKIP LOCKED`, so of two sweepers only one gets each run. Then, in order:
+  - a run whose stored turn can't be read ends with `RUN_ERROR` code `storage_error` and the validation error,
+  - a run someone asked to cancel ends as cancelled,
+  - a run started more than `[runs] resume_within_s` seconds ago, by the database's clock like every lease time, ends with `RUN_ERROR` code `timeout` and "The assistant stopped responding.",
+  - a run taken over more than `[runs] max_attempts` times ends with `RUN_ERROR` code `timeout` and "The assistant kept stopping on this message.",
+  - every other run resumes.
+- **Handing over.** When a process shuts down, it stops its workers without ending their runs, waits for runs that already ended to close what they held, and clears its running runs' `heartbeat_at`, so the next sweep of any process takes them over.
+- **Upkeep.** The sweep and the startup sweep log any error and go on, as do the heartbeat and the listener, so none of them stops for good.
+
+A resumed run first records a `CUSTOM` event named `run_resumed`, so a client drops any text it got halfway, then runs again. It opens the agent's graph again, with everything the run holds open, such as Sothoth's browser, and reads the thread's latest checkpoint:
+
+- **The checkpoint finished the turn.** It holds the run's user message, whose id is the run's id, and has no tasks left, so the process died after the graph ended and before the run's end committed. The run ends at once: it sends the checkpoint's last AI message as `TEXT_MESSAGE_START`, `TEXT_MESSAGE_CONTENT` and `TEXT_MESSAGE_END`, records it in `messages` as the answer, and ends with `RUN_FINISHED`. The model isn't called.
+- **The checkpoint holds the turn's message, with tasks left.** The turn continues from the checkpoint: `LangGraphAgent` gets `forwardedProps.nodeName` set to the first node the step before the latest one had waiting, which is `ag-ui-langgraph`'s continue mode. `ag-ui-langgraph` checks that node against the thread's history itself and ignores it when the latest step didn't run it. It streams the graph with no input, so LangGraph runs only the tasks the checkpoint still has waiting, such as the tool call the dead process was in, and keeps the results of the tasks that finished.
+- **Otherwise** the run starts its turn again from `runs.input`.
+
+A resumed step runs its tools again, so a tool with side effects, such as one that sends a message or books something, must be idempotent: calling it twice with the same arguments must do it once. Every run has exactly one `RUN_STARTED`, the one `POST /<name>` recorded, because the worker always drops the one `LangGraphAgent` sends; that holds even when the process dies before the graph opens, or a cancel or timeout ends the run first. Every run also has exactly one terminal event. A resumed run's `usage` counts only the model calls made after the resume.
+
+A client that loses its connection reconnects with the id of the last event it got:
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant A as Replica A
+  participant W as Worker on A
+  participant P as Postgres
+  C->>A: POST /sothoth {runId}
+  A->>P: INSERT runs (owner = A) and RUN_STARTED
+  A->>W: start the run
+  A->>P: LISTEN
+  W->>P: INSERT run_events, NOTIFY run_events
+  P-->>A: notification
+  A-->>C: SSE id: 41
+  C--xA: connection drops
+  W->>P: INSERT run_events 42, 43
+  C->>A: GET /sothoth/runs/{id}/events, Last-Event-ID: 41
+  A->>P: SELECT run_events WHERE id > 41
+  A-->>C: SSE 42, 43, then new events until RUN_FINISHED
+```
+
+A replica that dies is taken over by another:
+
+```mermaid
+sequenceDiagram
+  participant A as Replica A
+  participant P as Postgres
+  participant B as Replica B
+  participant C as Client
+  A->>P: heartbeat_at = now() every 10 s
+  A--xA: process dies mid-run
+  Note over P: heartbeat_at goes stale
+  B->>P: UPDATE runs SET owner = B, attempts + 1 WHERE heartbeat_at older than 30 s RETURNING
+  B->>P: INSERT CUSTOM run_resumed
+  B->>B: open the graph, continue from the checkpoint
+  B->>P: INSERT run_events ..., then RUN_FINISHED with status finished
+  C->>B: GET /sothoth/runs/{id}/events, Last-Event-ID
+  B-->>C: run_resumed, the resumed events, RUN_FINISHED
+```
+
+A cancel reaches the run's process wherever the request lands:
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant B as Replica B
+  participant P as Postgres
+  participant A as Replica A, the run's owner
+  C->>B: POST /sothoth/runs/{id}/cancel
+  B->>P: UPDATE runs SET cancel_requested_at = now(), NOTIFY run_cancels
+  B-->>C: 202
+  P-->>A: notification
+  A->>A: cancel the worker
+  A->>P: RUN_FINISHED with outcome cancelled, status cancelled
+  Note over A,P: a missed notification is seen at A's next heartbeat
+```
+
+### Connections and limits
+
+Each process opens, on one Postgres:
+
+| Connections                   | For                                                                                  |
+| ----------------------------- | ------------------------------------------------------------------------------------ |
+| `[database] pool_size`, + 10  | The engine requests and workers use; SQLAlchemy opens up to 10 more past `pool_size` |
+| `[database] pool_size`        | The checkpointer's psycopg pool                                                      |
+| `[database] upkeep_pool_size` | The engine the heartbeat, the sweep and the hand-over use, 2 by default              |
+| 1                             | The `LISTEN` connection                                                              |
+
+A worker holds one connection of the request engine for its whole run, and briefly a second one to end the run after an error or a cancel, so `[runs] max_workers` workers take up to twice that many. Keep `2 × max_workers` below `pool_size + 10`, so requests and readers always find one: the defaults, 4 workers on a pool of 5, leave at least 7. The heartbeat and the sweep have their own engine, so busy workers and readers can't hold up marking runs alive, which would let another process take them over. A process therefore holds up to `2 × pool_size + 10 + upkeep_pool_size + 1` connections, 23 by default; size Postgres's `max_connections` for that many per process.
+
+What recovery doesn't cover:
+
+- **Checkpoint writes aren't fenced.** Fencing guards `run_events` and the run's end, not LangGraph's checkpoints. A process that pauses, such as a long garbage collection or a frozen VM, and loses its runs can still write checkpoints for them until its next fenced event or heartbeat stops the worker, while the new owner writes its own. Each continues from its own checkpoints, and the thread's next turn starts from whichever was written last, which can be the old process's.
+- **One `NOTIFY` per event.** Every recorded event sends its own notification, which is a write to Postgres's notification queue in the event's transaction. It is a candidate to batch, such as one notification per transaction or per stream chunk, if measurements show it costs too much.
 
 ### Events
 
-[`ag-ui-langgraph`](https://pypi.org/project/ag-ui-langgraph/)'s `LangGraphAgent` turns the LangGraph run into AG-UI events. It gets the graph's own config, which carries `recursion_limit`, because it would otherwise run the graph at LangGraph's default of 25 steps, and `subagent_visibility="attributed"`, so a subagent's events carry its `subagentRunId`. `run_events` in `src/app/agui/events.py` then:
+[`ag-ui-langgraph`](https://pypi.org/project/ag-ui-langgraph/)'s `LangGraphAgent` turns the LangGraph run into AG-UI events. It gets the graph's own config, which carries `recursion_limit`, because it would otherwise run the graph at LangGraph's default of 25 steps, and `subagent_visibility="attributed"`, so a subagent's events carry its `subagentRunId`. `record_run` in `src/app/agui/events.py` then:
 
 - drops the `MESSAGES_SNAPSHOT` and `STATE_SNAPSHOT` that would resend the whole lifelong thread every run. `RAW` events are off.
 - stamps every event with `timestamp`, in milliseconds since the epoch, and `metadata.agent`: the served agent, or the subagent named by the `SUBAGENT_STARTED` event whose `subagentRunId` the event carries, such as `general-purpose`.
-- records each event in `run_events`, committing each one, and only then sends it as an SSE event whose `id:` is that row's id. The run holds one database connection for its whole stream. FastAPI's `EventSourceResponse` writes the SSE and sends a `: ping` comment every 15 seconds the run is quiet.
-- records the terminal event, `RUN_FINISHED` or `RUN_ERROR`, in one transaction with the run's end: the `runs` row's status, error and times, the agent's answer in `messages`, and the rows of `run_model_usage` and `run_tool_usage`. `finish_run` updates the run only while its status is `running`, and records nothing more when it already ended. The run counts as ended only once that transaction commits.
+- drops the `RUN_STARTED` `LangGraphAgent` sends, because `POST /<name>` already recorded the run's own.
+- records each event in `run_events`, committing each one. Readers send only recorded events, each as an SSE event whose `id:` is that row's id. The worker holds one database connection for the whole run. FastAPI's `EventSourceResponse` writes the SSE and sends a `: ping` comment every 15 seconds the run is quiet.
+- records the terminal event, `RUN_FINISHED` or `RUN_ERROR`, in one transaction with the run's end: the `runs` row's status, error and times, the agent's answer in `messages`, and the rows of `run_model_usage` and `run_tool_usage`. `finish_run` updates the run only while its status is `running` and the process owns it, records nothing more otherwise, and says which, so the worker logs "run ended" or "run lost to another process". The run counts as ended only once that transaction commits.
 
 A run starts with `RUN_STARTED`, streams `TEXT_MESSAGE_*` as the model writes and `TOOL_CALL_*` for each tool call and its result, and ends with exactly one `RUN_FINISHED` or `RUN_ERROR`. A tool that returns an error message to the model is its result, and the run goes on.
 
@@ -133,26 +240,26 @@ A run starts with `RUN_STARTED`, streams `TEXT_MESSAGE_*` as the model writes an
 | `model_error`     | The model's provider failed, including building its client while opening the graph, such as a missing API key, or anything else the graph raised |
 | `storage_error`   | Recording one of the run's events in Postgres failed                                                                                             |
 
-`LangGraphAgent` catches what the graph raises and ends the run with `RUN_ERROR` itself; `RunUsage` keeps the error so the harness can give its code. When opening the graph fails, or something the run holds open crashes mid-run, `_agent_events` catches it with `except*`, because an MCP session's task groups wrap it in exception groups. It reports the innermost error, after a `RUN_STARTED` when the run hadn't started, so every run has exactly one start and one end. A failure after the run's terminal event, such as closing the browser, is logged with its traceback, not sent.
+`LangGraphAgent` catches what the graph raises and ends the run with `RUN_ERROR` itself; `RunUsage` keeps the error so the harness can give its code. When opening the graph fails, or something the run holds open crashes mid-run, `_agent_events` catches it with `except*`, because an MCP session's task groups wrap it in exception groups. It reports the innermost error, so every run has exactly one end after the `RUN_STARTED` recorded when it started. A failure after the run's terminal event, such as closing the browser, is logged with its traceback, not sent.
 
-When recording an event fails, the run stops, and the harness records and sends a `RUN_ERROR` with code `storage_error` and the database's message, on a new connection, so the run ends as `error`, not `cancelled`. The event that failed is never sent, so the events a client got are always the ones recorded.
+When recording an event fails, the run stops, and the harness records a `RUN_ERROR` with code `storage_error` and the database's message, on a new connection, so the run ends as `error`. The event that failed is never sent, because clients get only recorded events. A run that is no longer the process's own (see fencing in [Runs and recovery](#runs-and-recovery)) is not an error: its worker stops and records nothing.
 
 ### What Postgres keeps
 
 The harness's tables live in the `harness` schema (`[database] schema_name`) of the Postgres the root `docker-compose.yaml` runs, created by the Alembic migrations in `migrations/` (see [running the harness](../development/running.md)). `src/infrastructure/persistence/tables.py` defines them with SQLAlchemy Core:
 
-| Table             | Holds                                                                                                                              |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `threads`         | One row per agent, client and user                                                                                                 |
-| `runs`            | Each run: its thread, `status`, `error_code`, `error`, the turn it ran as `input`, and when it started, first wrote text and ended |
-| `run_events`      | Every event a run sent, in order, with the agent that produced it                                                                  |
-| `messages`        | The transcript: each run's user text and, when it finished, the agent's final text                                                 |
-| `run_model_usage` | Each run's tokens by agent, provider and model; `model` is null when the chat model doesn't name it                                |
-| `run_tool_usage`  | Each run's tool calls, failures and time by agent, tool and provider; `provider` is null for a tool that reports none              |
+| Table             | Holds                                                                                                                                                                                                                                       |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `threads`         | One row per agent, client and user                                                                                                                                                                                                          |
+| `runs`            | Each run: its thread, `status`, `error_code`, `error`, the turn it ran as `input`, when it started, first wrote text and ended, its lease: `owner`, `heartbeat_at`, `cancel_requested_at`, and `attempts`, the times a process took it over |
+| `run_events`      | Every event a run sent, in order, with the agent that produced it                                                                                                                                                                           |
+| `messages`        | The transcript: each run's user text and, when it finished, the agent's final text                                                                                                                                                          |
+| `run_model_usage` | Each run's tokens by agent, provider and model; `model` is null when the chat model doesn't name it                                                                                                                                         |
+| `run_tool_usage`  | Each run's tool calls, failures and time by agent, tool and provider; `provider` is null for a tool that reports none                                                                                                                       |
 
 `run_events`, `messages`, `run_model_usage` and `run_tool_usage` are deleted with their run (`ON DELETE CASCADE`). The usage tables' unique constraints treat nulls as equal (`NULLS NOT DISTINCT`), so a run has one row per agent and model, and per agent, tool and provider, even when `model` or `provider` is null. Every other usage column is `NOT NULL`.
 
-`status` is a `RunStatus` and `error_code` a `RunErrorCode`, both Python `StrEnum`s stored as text: `running`, then `finished` (`RUN_FINISHED`), `error` (`RUN_ERROR`) or `cancelled` (the client left before the run's terminal event).
+`status` is a `RunStatus` and `error_code` a `RunErrorCode`, both Python `StrEnum`s stored as text: `running`, then `finished` (`RUN_FINISHED`), `error` (`RUN_ERROR`) or `cancelled` (`RUN_FINISHED` with the cancelled outcome). A partial index on `heartbeat_at` where `status = 'running'` keeps the sweep cheap.
 
 LangGraph's `AsyncPostgresSaver` keeps the checkpoints in the same schema, through a psycopg pool whose connections set `search_path` to it. The app opens the pool when it starts and creates LangGraph's tables, one process at a time under an advisory lock. The pool checks each connection before lending it, so a Postgres restart doesn't fail the next runs. The SQLAlchemy engine on the harness's own tables doesn't check connections before use: after a Postgres restart, the first query on a stale connection fails, and SQLAlchemy then drops every connection the engine held before it.
 
@@ -160,7 +267,7 @@ A long conversation is summarised by deepagents' summarisation middleware, which
 
 ### The container
 
-`Container` wires the settings, the agent registry, the engine on the harness's tables, the checkpointer's pool and saver, the realm's keys and the `agents` list. It is the only place that reads the settings: `create_app` puts the engine, the keys, the `[auth]` settings and the agents on `app.state`, and each agent's container passes the settings its model, tools and graph need. To serve a new agent, add `src/app/container/<agent>.py` with a `<Agent>Container` that takes the settings, the registry and the checkpointer as dependencies and provides the agent's `ServedAgent`, with its `model_provider` from the registry, and a `model` factory on `llm_provider`. Wire it in `Container` with `providers.Container`, and add its `served` to `agents`.
+`Container` wires the settings, the agent registry, the engine on the harness's tables, the smaller `upkeep_engine` the runner marks runs alive and sweeps with, the checkpointer's pool and saver, the realm's keys, the `agents` list and the `runner`, which takes the `[runs]` settings. It is the only place that reads the settings: `create_app` puts the engine, the keys, the `[auth]` settings, the agents and the runner on `app.state`, the app's lifespan keeps the runner's sweep, heartbeat and listener going, and each agent's container passes the settings its model, tools and graph need. To serve a new agent, add `src/app/container/<agent>.py` with a `<Agent>Container` that takes the settings, the registry and the checkpointer as dependencies and provides the agent's `ServedAgent`, with its `model_provider` from the registry, and a `model` factory on `llm_provider`. Wire it in `Container` with `providers.Container`, and add its `served` to `agents`.
 
 ## Observability
 

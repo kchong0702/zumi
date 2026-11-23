@@ -21,13 +21,13 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 class RunStatus(StrEnum):
     running = "running"
-    """The run is streaming its events"""
+    """The run is recording its events"""
 
     finished = "finished"
     """The run ended with RUN_FINISHED"""
 
     cancelled = "cancelled"
-    """The client left before the run sent RUN_FINISHED or RUN_ERROR"""
+    """The run was cancelled and ended with RUN_FINISHED's cancelled outcome"""
 
     error = "error"
     """The run ended with RUN_ERROR"""
@@ -48,6 +48,14 @@ class RunErrorCode(StrEnum):
 
     storage_error = "storage_error"
     """Recording one of the run's events in Postgres failed"""
+
+
+class RunChannel(StrEnum):
+    events = "run_events"
+    """Notified with a run's id when the run records an event"""
+
+    cancels = "run_cancels"
+    """Notified with a run's id when someone asks to cancel the run"""
 
 
 class MessageRole(StrEnum):
@@ -89,14 +97,24 @@ runs = Table(
     ),
     Column("first_token_at", DateTime(timezone=True)),
     Column("finished_at", DateTime(timezone=True)),
+    Column("owner", Text),
+    Column("heartbeat_at", DateTime(timezone=True)),
+    Column("cancel_requested_at", DateTime(timezone=True)),
+    Column("attempts", Integer, nullable=False, server_default=text("0")),
     Index(
         "ix_runs_running_thread_id",
         "thread_id",
         unique=True,
         postgresql_where=text("status = 'running'"),
     ),
+    Index(
+        "ix_runs_running_heartbeat_at",
+        "heartbeat_at",
+        postgresql_where=text("status = 'running'"),
+    ),
 )
-"""Each run of an agent on a thread, with the turn it ran"""
+"""Each run of an agent on a thread, with the turn it ran and the process working
+on it"""
 
 run_events = Table(
     "run_events",

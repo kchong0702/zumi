@@ -172,6 +172,48 @@ class DatabaseSettings(BaseModel):
     pool_size: int = Field(default=5, gt=0)
     """Connections each pool keeps open"""
 
+    upkeep_pool_size: int = Field(default=2, gt=0)
+    """Connections the engine that marks runs alive and sweeps keeps open"""
+
+
+class RunSettings(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, use_attribute_docstrings=True
+    )
+
+    heartbeat_s: float = Field(default=10, gt=0)
+    """How often a process marks the runs it works on as alive"""
+
+    sweep_s: float = Field(default=15, gt=0)
+    """How often a process looks for runs whose process stopped marking them alive"""
+
+    dead_after_s: float = Field(default=30, gt=0)
+    """A running run not marked alive for this long is taken over"""
+
+    resume_within_s: float = Field(default=600, gt=0)
+    """A taken-over run started this recently resumes; an older one ends as a
+    timeout"""
+
+    poll_s: float = Field(default=5, gt=0)
+    """Longest a reader waits for a run's next event before looking again, in case
+    a notification was missed"""
+
+    max_workers: int = Field(default=4, ge=1)
+    """Most runs one process works on at once"""
+
+    max_attempts: int = Field(default=3, ge=1)
+    """Most times a run is taken over and resumed before it ends as a timeout"""
+
+    retry_after_s: int = Field(default=5, gt=0)
+    """The Retry-After a run refused by a process at max_workers gets"""
+
+    @model_validator(mode="after")
+    def _lease_outlives_heartbeats(self) -> Self:
+        """Refuses a dead_after_s shorter than two heartbeats"""
+        if self.dead_after_s < 2 * self.heartbeat_s:
+            raise ValueError("runs.dead_after_s must be at least twice heartbeat_s")
+        return self
+
 
 class AuthSettings(BaseModel):
     model_config = ConfigDict(
@@ -302,6 +344,9 @@ class Settings(BaseSettings):
 
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     """The Postgres that keeps threads, runs, transcripts and checkpoints"""
+
+    runs: RunSettings = Field(default_factory=RunSettings)
+    """How processes keep their runs alive and take over those of stopped ones"""
 
     auth: AuthSettings = Field(default_factory=AuthSettings)
     """How callers' Keycloak tokens are checked"""

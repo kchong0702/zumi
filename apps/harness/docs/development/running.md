@@ -22,6 +22,24 @@ curl -N http://127.0.0.1:8300/sothoth \
 
 The harness runs only the last user message in `messages`. A body without one gets 422 and nothing is recorded.
 
+The run goes on when `curl` stops. To pick it up again, send the same body with the id of the last event you got, or ask for its events:
+
+```bash
+curl -N http://127.0.0.1:8300/sothoth/runs/$RUN_ID/events \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Last-Event-ID: 41"
+curl -X POST http://127.0.0.1:8300/sothoth/runs/$RUN_ID/cancel \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Several processes
+
+Run as many harness processes as you like on one Postgres, such as `[app] workers` above 1 or several replicas. Each one works on the runs it starts, marks them alive every `[runs] heartbeat_s` seconds and takes over the runs of a process that stopped marking its runs alive for `[runs] dead_after_s` seconds, at most `[runs] sweep_s` seconds later (see [runs and recovery](../architecture/overview.md#runs-and-recovery)). A process that shuts down hands its runs over at once. Processes reach each other through Postgres `LISTEN/NOTIFY`, so they need no other network between them.
+
+Each process works on at most `[runs] max_workers` runs at once. A run past that gets 503 with `Retry-After`, and a sweep takes over no more runs than the process has free workers for. A process holds up to 23 Postgres connections with the default settings, so size `max_connections` for that many per process (see [connections and limits](../architecture/overview.md#connections-and-limits)).
+
+While clients are reading a run, uvicorn waits for their connections before it shuts the app down, so a process with readers hands its runs over only once they leave or uvicorn stops waiting.
+
 ## In Docker Compose
 
 `docker-compose.yaml` runs the harness under the `apps` profile, and the root `docker-compose.yaml` includes it. It waits for Postgres and Keycloak, points `ZUMI_HARNESS_DATABASE__URL` at `postgres:5432` with the root `POSTGRES_*` variables, fetches the realm's keys from `keycloak:8080`, asks SearXNG at `searxng:8080` and sends traces to `otel-collector:4318` when tracing is on. Build the image with `pnpm exec nx run harness:build`, then apply its migrations with:
@@ -48,4 +66,4 @@ Tests need no database or Keycloak. They make their own RSA key and serve its JW
 ZUMI_HARNESS_TEST_DATABASE_URL=postgresql+psycopg://zumi:zumi@127.0.0.1:5433/zumi uv run pytest -m postgres
 ```
 
-Each of those tests works in a schema of its own and drops it.
+Each of those tests works in a schema of its own and drops it. The recovery tests start two or three apps on that schema, one standing in for a replica that dies or shuts down mid-run, with a tool that waits until the test lets it answer. Readers in those tests look again only after 30 seconds, so a test that follows a run within its time limit passes only when `NOTIFY` works.

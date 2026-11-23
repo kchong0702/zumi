@@ -23,17 +23,19 @@ def health_check(request: Request) -> dict[str, str]:
 
 @asynccontextmanager
 async def _lifespan(container: Container) -> AsyncIterator[None]:
-    """Opens Postgres with LangGraph's tables while the app runs, then closes it and
-    flushes traces and metrics"""
+    """Opens Postgres with LangGraph's tables and keeps runs going while the app runs,
+    then hands this process's runs over, closes Postgres and flushes telemetry"""
     await open_postgres(
         container.engine(),
         container.pool(),
         container.settings().database.schema_name,
         container.checkpointer(),
     )
-    yield
+    async with container.runner().kept():
+        yield
     await container.pool().close()
     await container.engine().dispose()
+    await container.upkeep_engine().dispose()
     shutdown_metrics()
     shutdown_tracing()
 
@@ -56,6 +58,7 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.state.jwks = container.jwks()
     app.state.auth = settings.auth
     app.state.agents = {served.name: served for served in container.agents()}
+    app.state.runner = container.runner()
     app.add_api_route(path="/health", endpoint=health_check, methods=["GET"])
     app.include_router(router)
     return app
